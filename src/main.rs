@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod detector;
+
 use anyhow::Result;
+use detector::{GenericNodeDetector, GoogleCloudResourceDetector};
 use google_cloud_auth::credentials::{CacheableResource, Credentials, EntityTag};
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::{global, KeyValue};
@@ -37,11 +40,18 @@ const OTEL_KEY_SERVICE_NAME: &str = "service.name";
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let project_id = std::env::var("GOOGLE_CLOUD_PROJECT")
-        .unwrap_or_else(|_| "xlai-sdk-project".to_string());
+    let project_id =
+        std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "xlai-sdk-project".to_string());
+
+    let node = GenericNodeDetector::new();
+    let detector = GoogleCloudResourceDetector::builder()
+        .with_fallback(node.detect())
+        .build()
+        .await?;
 
     // 1. Initialize the Metrics Provider using the Builder pattern
     let provider = Builder::new(&project_id, "xlai-metrics-experiment")
+        .with_detector(node.clone())
         .build()
         .await
         .expect("failed to build provider");
@@ -55,7 +65,10 @@ async fn main() -> Result<()> {
 
     // 3. Record some data
     println!("Recording metrics for project: {}", project_id);
-    let attributes = [KeyValue::new("xlai-metrics-experiment_id", uuid::Uuid::new_v4().to_string())];
+    let attributes = [KeyValue::new(
+        "xlai_metrics_experiment_id",
+        uuid::Uuid::new_v4().to_string(),
+    )];
     for i in 1..=10 {
         histogram.record(i as f64 * 0.1, &attributes);
     }
@@ -119,11 +132,16 @@ impl Builder {
     pub async fn build(self) -> Result<SdkMeterProvider> {
         let resource = opentelemetry_sdk::Resource::builder()
             .with_attributes(vec![
-                KeyValue::new(OTEL_KEY_GCP_PROJECT_ID, self.project_id),
-                KeyValue::new(OTEL_KEY_SERVICE_NAME, self.service_name),
+                KeyValue::new(OTEL_KEY_GCP_PROJECT_ID, self.project_id.clone()),
+                KeyValue::new(OTEL_KEY_SERVICE_NAME, self.service_name.clone()),
             ])
             .with_detectors(&Vec::from_iter(self.detector.into_iter()))
             .build();
+
+        tracing::info!(
+            "Initializing SdkMeterProvider with resource: {:?}",
+            resource
+        );
 
         let credentials = match self.credentials {
             Some(c) => c,
@@ -137,10 +155,17 @@ impl Builder {
                 .with_endpoint(self.endpoint.to_string())
                 .with_interceptor(interceptor);
 
-            if self.endpoint.scheme().is_none_or(|s| s != &http::uri::Scheme::HTTPS) {
+            if self
+                .endpoint
+                .scheme()
+                .is_none_or(|s| s != &http::uri::Scheme::HTTPS)
+            {
                 builder
             } else {
-                let domain = self.endpoint.authority().ok_or_else(|| anyhow::anyhow!("invalid URI"))?;
+                let domain = self
+                    .endpoint
+                    .authority()
+                    .ok_or_else(|| anyhow::anyhow!("invalid URI"))?;
                 let config = ClientTlsConfig::new()
                     .with_enabled_roots()
                     .domain_name(domain.host());
@@ -208,7 +233,9 @@ impl CloudTelemetryAuthInterceptor {
         tokio::spawn(refresh_task(credentials, tx));
 
         // Wait for the first refresh to complete.
-        let _ = rx.changed().await;
+        if rx.borrow().is_none() {
+            let _ = rx.changed().await;
+        }
         Self { rx }
     }
 }
@@ -216,9 +243,10 @@ impl CloudTelemetryAuthInterceptor {
 impl Interceptor for CloudTelemetryAuthInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         let rx_ref = self.rx.borrow();
-        let metadata = rx_ref
-            .as_ref()
-            .ok_or_else(|| Status::unauthenticated("GCP credentials unavailable"))?;
+        let metadata = rx_ref.as_ref().ok_or_else(|| {
+            tracing::error!("GCP credentials unavailable in interceptor");
+            Status::unauthenticated("GCP credentials unavailable")
+        })?;
 
         for entry in metadata.iter() {
             match entry {
@@ -258,18 +286,29 @@ async fn refresh_task(credentials: Credentials, tx: watch::Sender<Option<Metadat
                 }
 
                 if tx.send(Some(metadata)).is_err() {
+                    tracing::warn!("Auth refresh task: receiver dropped, stopping");
                     break;
                 }
                 last_etag = Some(entity_tag);
+                tracing::debug!(
+                    "Auth refreshed successfully, next refresh in {:?}",
+                    REFRESH_INTERVAL
+                );
                 tokio::time::sleep(REFRESH_INTERVAL).await;
             }
             Ok(CacheableResource::NotModified) => {
+                tracing::debug!(
+                    "Auth not modified, checking again in {:?}",
+                    REFRESH_INTERVAL
+                );
                 tokio::time::sleep(REFRESH_INTERVAL).await;
             }
             Err(e) => {
+                tracing::error!("Auth refresh failed: {:?}", e);
                 if e.is_transient() {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 } else {
+                    tracing::error!("Auth refresh failed (fatal): {:?}", e);
                     break;
                 }
             }
