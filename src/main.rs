@@ -15,7 +15,7 @@
 mod detector;
 
 use anyhow::Result;
-use detector::{GenericNodeDetector, GoogleCloudResourceDetector};
+use detector::GenericNodeDetector;
 use google_cloud_auth::credentials::{CacheableResource, Credentials, EntityTag};
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::{global, KeyValue};
@@ -44,10 +44,6 @@ async fn main() -> Result<()> {
         std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "xlai-sdk-project".to_string());
 
     let node = GenericNodeDetector::new();
-    let detector = GoogleCloudResourceDetector::builder()
-        .with_fallback(node.detect())
-        .build()
-        .await?;
 
     // 1. Initialize the Metrics Provider using the Builder pattern
     let provider = Builder::new(&project_id, "xlai-metrics-experiment")
@@ -59,7 +55,7 @@ async fn main() -> Result<()> {
     // 2. Create a Histogram Metric
     let meter = provider.meter("xlai-metrics-experiment-meter");
     let histogram = meter
-        .f64_histogram("xlai-metrics-experiment.histogram")
+        .f64_histogram("xlai-metrics-experiment.histogram2")
         .with_unit("s")
         .build();
 
